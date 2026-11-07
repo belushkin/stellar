@@ -30,6 +30,25 @@ docker run --rm --env-file .env \
   stellar-dex-trading-scanner
 ```
 
+For a persistent background run, use the helper script instead of managing
+Docker commands manually:
+
+```sh
+chmod +x scripts/stellar.sh
+./scripts/stellar.sh check
+./scripts/stellar.sh start
+./scripts/stellar.sh status
+./scripts/stellar.sh logs --follow --since 10m
+./scripts/stellar.sh stop
+```
+
+`start` creates a container with the `unless-stopped` restart policy and the
+persistent `stellar-scanner-data` volume. Use `restart` to restart it with its
+current configuration, or `recreate` to rebuild and apply current source and
+`.env` changes while preserving the database volume. `status` shows the
+container state and recent output. The script only manages the observation-mode
+scanner; it does not enable paper or live order placement.
+
 ## Market data and asset identity
 
 The app validates configuration, initializes SQLite, checks the public Horizon
