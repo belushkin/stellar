@@ -10,13 +10,23 @@ describe("openDatabase", () => {
       expect(database.pragma("foreign_keys", { simple: true })).toBe(1);
       expect(database.pragma("busy_timeout", { simple: true })).toBe(5000);
       expect(database.prepare("SELECT version FROM schema_migrations").all())
-        .toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }]);
+        .toEqual([
+          { version: 1 },
+          { version: 2 },
+          { version: 3 },
+          { version: 4 },
+          { version: 5 },
+          { version: 6 },
+        ]);
       expect(database.prepare(`
         SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'paper_orders'
       `).get()).toEqual({ name: "paper_orders" });
       expect(database.prepare(`
         SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'paper_depth_allocations'
       `).get()).toEqual({ name: "paper_depth_allocations" });
+      expect(database.prepare(`
+        SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'research_execution_scenarios'
+      `).get()).toEqual({ name: "research_execution_scenarios" });
     } finally {
       database.close();
     }

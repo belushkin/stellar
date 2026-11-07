@@ -7,6 +7,8 @@ const INITIAL_SCHEMA_VERSION = 1;
 const PAPER_TRADING_SCHEMA_VERSION = 2;
 const PAPER_DEPTH_SCHEMA_VERSION = 3;
 const MARKET_OBSERVATION_SCHEMA_VERSION = 4;
+const HISTORICAL_REPLAY_SCHEMA_VERSION = 5;
+const HISTORICAL_REPLAY_DETAILS_SCHEMA_VERSION = 6;
 
 export function openDatabase(databasePath: string): Database.Database {
   if (databasePath !== ":memory:") {
@@ -466,6 +468,154 @@ export function openDatabase(databasePath: string): Database.Database {
     database
       .prepare("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)")
       .run(MARKET_OBSERVATION_SCHEMA_VERSION, new Date().toISOString());
+  })();
+
+  database.transaction(() => {
+    const hasReplayMigration = database
+      .prepare("SELECT 1 FROM schema_migrations WHERE version = ?")
+      .get(HISTORICAL_REPLAY_SCHEMA_VERSION);
+    if (hasReplayMigration !== undefined) {
+      return;
+    }
+
+    database.exec(`
+      CREATE TABLE historical_replay_runs (
+        replay_run_id TEXT PRIMARY KEY,
+        input_fingerprint TEXT NOT NULL,
+        model_version TEXT NOT NULL,
+        execution_mode TEXT NOT NULL CHECK (execution_mode IN ('independent_counterfactual')),
+        created_at_ms INTEGER NOT NULL,
+        completed_at_ms INTEGER,
+        status TEXT NOT NULL CHECK (status IN ('running', 'complete', 'failed')),
+        scenario_count INTEGER NOT NULL DEFAULT 0,
+        quality_summary_json TEXT NOT NULL DEFAULT '{}',
+        UNIQUE (input_fingerprint, model_version, execution_mode)
+      );
+
+      CREATE TABLE research_execution_scenarios (
+        scenario_id TEXT PRIMARY KEY,
+        replay_run_id TEXT NOT NULL REFERENCES historical_replay_runs(replay_run_id),
+        source_decision_id TEXT NOT NULL REFERENCES strategy_decisions(decision_id),
+        source_hypothetical_order_id TEXT NOT NULL
+          REFERENCES hypothetical_orders(hypothetical_order_id),
+        pair_id TEXT NOT NULL REFERENCES trading_pairs(pair_id),
+        side TEXT NOT NULL CHECK (side IN ('buy', 'sell')),
+        limit_price TEXT NOT NULL,
+        requested_base TEXT NOT NULL,
+        placement_at_ms INTEGER NOT NULL,
+        placement_snapshot_id INTEGER NOT NULL REFERENCES market_snapshots(id),
+        initial_visible_queue_base TEXT NOT NULL,
+        starting_trade_cursor TEXT,
+        expires_at_ms INTEGER NOT NULL,
+        model_version TEXT NOT NULL,
+        execution_mode TEXT NOT NULL CHECK (execution_mode = 'independent_counterfactual'),
+        status TEXT NOT NULL CHECK (
+          status IN ('modeled_fill', 'partial_fill', 'no_fill_evidence', 'uncertain', 'incomplete')
+        ),
+        estimated_fill_lower_base TEXT NOT NULL,
+        estimated_fill_upper_base TEXT NOT NULL,
+        remaining_lower_base TEXT NOT NULL,
+        remaining_upper_base TEXT NOT NULL,
+        first_fill_at_ms INTEGER,
+        evidence_quality TEXT NOT NULL CHECK (
+          evidence_quality IN ('sufficient', 'uncertain', 'incomplete')
+        ),
+        confidence TEXT NOT NULL CHECK (
+          confidence IN ('high', 'medium', 'low', 'none')
+        ),
+        quality_reasons_json TEXT NOT NULL,
+        created_at_ms INTEGER NOT NULL,
+        UNIQUE (replay_run_id, source_decision_id)
+      );
+      CREATE INDEX research_execution_scenarios_run_pair
+        ON research_execution_scenarios(replay_run_id, pair_id, placement_at_ms);
+
+      CREATE TABLE research_execution_events (
+        scenario_id TEXT NOT NULL REFERENCES research_execution_scenarios(scenario_id),
+        trade_id TEXT NOT NULL REFERENCES market_trades(trade_id),
+        event_at_ms INTEGER NOT NULL,
+        trade_price TEXT NOT NULL,
+        public_trade_volume_base TEXT NOT NULL,
+        queue_ahead_lower_before_base TEXT NOT NULL,
+        queue_ahead_upper_before_base TEXT NOT NULL,
+        modeled_fill_lower_base TEXT NOT NULL,
+        modeled_fill_upper_base TEXT NOT NULL,
+        fill_classification TEXT NOT NULL CHECK (
+          fill_classification IN (
+            'confirmed_public_trade_evidence',
+            'modeled_fill_estimate',
+            'uncertain_fill',
+            'no_fill_evidence'
+          )
+        ),
+        quality_reasons_json TEXT NOT NULL,
+        PRIMARY KEY (scenario_id, trade_id)
+      );
+      CREATE INDEX research_execution_events_scenario_time
+        ON research_execution_events(scenario_id, event_at_ms);
+
+      CREATE TABLE research_markout_observations (
+        scenario_id TEXT NOT NULL REFERENCES research_execution_scenarios(scenario_id),
+        fill_trade_id TEXT NOT NULL REFERENCES market_trades(trade_id),
+        horizon_seconds INTEGER NOT NULL CHECK (horizon_seconds IN (5, 30, 60, 300, 900)),
+        target_at_ms INTEGER NOT NULL,
+        sampled_snapshot_id INTEGER REFERENCES market_snapshots(id),
+        sampled_at_ms INTEGER,
+        sampling_deviation_ms INTEGER,
+        status TEXT NOT NULL CHECK (status IN ('complete', 'pending', 'incomplete', 'invalid')),
+        fill_base TEXT NOT NULL,
+        fill_price TEXT NOT NULL,
+        spread_capture_quote TEXT,
+        post_fill_price_movement_quote TEXT,
+        liquidation_impact_quote TEXT,
+        estimated_fees_quote TEXT,
+        net_markout_quote TEXT,
+        quality_reasons_json TEXT NOT NULL,
+        PRIMARY KEY (scenario_id, fill_trade_id, horizon_seconds)
+      );
+      CREATE INDEX research_markout_horizon_status
+        ON research_markout_observations(horizon_seconds, status, target_at_ms);
+    `);
+
+    database
+      .prepare("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)")
+      .run(HISTORICAL_REPLAY_SCHEMA_VERSION, new Date().toISOString());
+  })();
+
+  database.transaction(() => {
+    const hasReplayDetailsMigration = database
+      .prepare("SELECT 1 FROM schema_migrations WHERE version = ?")
+      .get(HISTORICAL_REPLAY_DETAILS_SCHEMA_VERSION);
+    if (hasReplayDetailsMigration !== undefined) {
+      return;
+    }
+
+    const scenarioColumns = database
+      .prepare("PRAGMA table_info(research_execution_scenarios)")
+      .all() as Array<{ name: string }>;
+    if (!scenarioColumns.some((column) => column.name === "initial_queue_lower_base")) {
+      database.exec(`
+        ALTER TABLE research_execution_scenarios
+          ADD COLUMN initial_queue_lower_base TEXT NOT NULL DEFAULT '0';
+      `);
+    }
+    if (!scenarioColumns.some((column) => column.name === "initial_queue_upper_base")) {
+      database.exec(`
+        ALTER TABLE research_execution_scenarios
+          ADD COLUMN initial_queue_upper_base TEXT NOT NULL DEFAULT '0';
+      `);
+    }
+    const eventColumns = database
+      .prepare("PRAGMA table_info(research_execution_events)")
+      .all() as Array<{ name: string }>;
+    if (!eventColumns.some((column) => column.name === "modeled_fill_price")) {
+      database.exec(`
+        ALTER TABLE research_execution_events ADD COLUMN modeled_fill_price TEXT;
+      `);
+    }
+    database
+      .prepare("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)")
+      .run(HISTORICAL_REPLAY_DETAILS_SCHEMA_VERSION, new Date().toISOString());
   })();
 
   return database;

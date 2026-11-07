@@ -20,6 +20,7 @@ Commands:
   status     Show container state and recent logs
   logs       Show the last 100 log lines; pass -f to follow
   report     Print an analytics report, optionally save it to a JSON file
+  replay     Run deterministic historical execution replay against persisted data
   build      Build the Docker image
   check      Validate .env using the current project code in Docker
   help       Show this help
@@ -108,20 +109,23 @@ run_report() {
       database.close();
     }
   '
-  if [ "$1" = "running" ]; then
-    docker exec \
-      -e STELLAR_DATABASE_PATH=/app/data/stellar-scanner.sqlite \
-      "$CONTAINER" \
-      node --import tsx -e "$report_script"
-  else
-    docker run --rm \
-      --volumes-from "$CONTAINER" \
-      --env-file "$ENV_FILE" \
-      -e STELLAR_DATABASE_PATH=/app/data/stellar-scanner.sqlite \
-      --entrypoint node \
-      "$IMAGE" \
-      --import tsx -e "$report_script"
-  fi
+  docker run --rm \
+    --volumes-from "$CONTAINER" \
+    --env-file "$ENV_FILE" \
+    -e STELLAR_DATABASE_PATH=/app/data/stellar-scanner.sqlite \
+    --entrypoint node \
+    "$IMAGE" \
+    --import tsx -e "$report_script"
+}
+
+run_replay() {
+  docker run --rm \
+    --volumes-from "$CONTAINER" \
+    --env-file "$ENV_FILE" \
+    -e STELLAR_DATABASE_PATH=/app/data/stellar-scanner.sqlite \
+    --entrypoint node \
+    "$IMAGE" \
+    --import tsx src/cli/replay.ts
 }
 
 require_docker
@@ -178,12 +182,27 @@ case "$command_name" in
       echo "Usage: $0 report [OUTPUT.json]" >&2
       exit 2
     fi
-    state=$(docker container inspect -f '{{.State.Status}}' "$CONTAINER")
+    build_image
     if [ "$#" -eq 1 ]; then
-      run_report "$state" > "$1"
+      run_report > "$1"
       echo "Observation report saved to $1" >&2
     else
-      run_report "$state"
+      run_report
+    fi
+    ;;
+  replay)
+    require_env
+    require_container
+    if [ "$#" -gt 1 ]; then
+      echo "Usage: $0 replay [OUTPUT.json]" >&2
+      exit 2
+    fi
+    build_image
+    if [ "$#" -eq 1 ]; then
+      run_replay > "$1"
+      echo "Historical replay summary saved to $1" >&2
+    else
+      run_replay
     fi
     ;;
   build)

@@ -40,6 +40,7 @@ chmod +x scripts/stellar.sh
 ./scripts/stellar.sh status
 ./scripts/stellar.sh logs --follow --since 10m
 ./scripts/stellar.sh report observation-report.json
+./scripts/stellar.sh replay replay-summary.json
 ./scripts/stellar.sh stop
 ```
 
@@ -56,6 +57,13 @@ report in a consistent read transaction. Reports generated mid-run include
 only data committed by the report's snapshot time; pending markouts and
 incomplete observations are expected until their horizons mature or any data
 gaps are resolved.
+
+`replay` builds a one-off container from the current source and attaches the
+scanner's data volume without stopping the scanner. It reads a consistent
+snapshot of persisted market inputs and writes only to the separate historical
+replay tables. Repeating the command with unchanged inputs is idempotent; new
+source data or a new model version creates a distinct replay run. The report
+includes the latest replay run and its data-quality counts.
 
 ## Market data and asset identity
 
@@ -152,6 +160,32 @@ depth rather than midpoint prices. Missing, stale, invalid, or insufficient
 book depth leaves the markout incomplete; unavailable fee conversion also
 prevents a complete net markout. Markout and performance summaries are kept per
 pair and strategy so unlike quote assets are never aggregated.
+
+The historical replay engine is a separate research workflow. It creates a
+counterfactual scenario for persisted `positive` and `insufficient_data`
+decisions without changing the decision or hypothetical-order status. It never
+calls the paper-trading engine and cannot submit transactions. Results use
+`independent_counterfactual` mode: scenarios may examine the same public trade,
+so scenario fills and markouts must not be added together as portfolio P&L.
+Portfolio-wide allocation across overlapping scenarios is not implemented.
+
+Replay uses local receive order for snapshots and trades, with the trade event
+timestamp and paging cursor as additional guards. Horizon order-book snapshots
+do not include a comparable exchange event timestamp or ledger sequence, so
+cross-stream ordering and queue changes are explicitly marked uncertain where
+they cannot be reconstructed. It tracks visible queue bounds, treats
+cancellations and newly joined liquidity conservatively, and never treats a
+price touch or a public trade as proof of the scanner's execution. It also
+requires snapshot coverage through each scenario's expiry; snapshot intervals
+over five minutes are classified as data gaps. Reported fill fractions are
+scenario outcome bounds, not statistically calibrated probabilities.
+
+Replay markouts are recorded separately at 5 seconds, 30 seconds, 1 minute,
+5 minutes, and 15 minutes. They use the modeled fill price, separate initial
+spread capture from subsequent midpoint movement, and value liquidation using
+opposite-side executable depth. Sampling delay, fees, and missing depth are
+reported per horizon. These are modeled counterfactual results, not paper
+fills or realized trading performance.
 
 Portfolio risk valuations use executable liquidation prices, known lot cost
 basis, same-day realized P&L, and simulated costs. Missing or stale books,
