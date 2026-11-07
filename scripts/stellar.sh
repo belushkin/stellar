@@ -19,6 +19,7 @@ Commands:
   recreate   Rebuild and recreate the container using the current .env
   status     Show container state and recent logs
   logs       Show the last 100 log lines; pass -f to follow
+  report     Print an analytics report, optionally save it to a JSON file
   build      Build the Docker image
   check      Validate .env using the current project code in Docker
   help       Show this help
@@ -86,6 +87,43 @@ require_container() {
   fi
 }
 
+run_report() {
+  report_script='
+    import Database from "better-sqlite3";
+    import { buildObservationReport } from "./src/reporting/observation-report.ts";
+
+    const database = new Database(process.env.STELLAR_DATABASE_PATH, {
+      readonly: true,
+      fileMustExist: true
+    });
+    try {
+      const createReport = database.transaction(() =>
+        buildObservationReport({
+          database,
+          portfolioId: process.env.STELLAR_PAPER_PORTFOLIO_ID ?? "default"
+        })
+      );
+      console.log(JSON.stringify(createReport.deferred(), null, 2));
+    } finally {
+      database.close();
+    }
+  '
+  if [ "$1" = "running" ]; then
+    docker exec \
+      -e STELLAR_DATABASE_PATH=/app/data/stellar-scanner.sqlite \
+      "$CONTAINER" \
+      node --import tsx -e "$report_script"
+  else
+    docker run --rm \
+      --volumes-from "$CONTAINER" \
+      --env-file "$ENV_FILE" \
+      -e STELLAR_DATABASE_PATH=/app/data/stellar-scanner.sqlite \
+      --entrypoint node \
+      "$IMAGE" \
+      --import tsx -e "$report_script"
+  fi
+}
+
 require_docker
 command_name=${1:-help}
 if [ "$#" -gt 0 ]; then
@@ -132,6 +170,21 @@ case "$command_name" in
       set -- --tail 100
     fi
     docker logs "$@" "$CONTAINER"
+    ;;
+  report)
+    require_env
+    require_container
+    if [ "$#" -gt 1 ]; then
+      echo "Usage: $0 report [OUTPUT.json]" >&2
+      exit 2
+    fi
+    state=$(docker container inspect -f '{{.State.Status}}' "$CONTAINER")
+    if [ "$#" -eq 1 ]; then
+      run_report "$state" > "$1"
+      echo "Observation report saved to $1" >&2
+    else
+      run_report "$state"
+    fi
     ;;
   build)
     build_image

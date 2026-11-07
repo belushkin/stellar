@@ -39,6 +39,7 @@ chmod +x scripts/stellar.sh
 ./scripts/stellar.sh start
 ./scripts/stellar.sh status
 ./scripts/stellar.sh logs --follow --since 10m
+./scripts/stellar.sh report observation-report.json
 ./scripts/stellar.sh stop
 ```
 
@@ -48,6 +49,13 @@ current configuration, or `recreate` to rebuild and apply current source and
 `.env` changes while preserving the database volume. `status` shows the
 container state and recent output. The script only manages the observation-mode
 scanner; it does not enable paper or live order placement.
+`report` can run while the scanner is collecting or after it is stopped. With
+no filename it prints JSON to standard output; with a filename it saves the
+report on the host. It opens the SQLite database read-only and evaluates the
+report in a consistent read transaction. Reports generated mid-run include
+only data committed by the report's snapshot time; pending markouts and
+incomplete observations are expected until their horizons mature or any data
+gaps are resolved.
 
 ## Market data and asset identity
 
