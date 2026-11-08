@@ -3,6 +3,15 @@
 Read-only Stellar DEX market scanner and paper-trading project. It needs no
 wallet or secret key and never signs or submits transactions.
 
+## Trading opportunity audit
+
+The 2026-11-08 audit decision is **STOP**: the available observations do not
+establish a credible path to positive net returns. The configured SQLite
+database was unavailable for analysis, and saved research evidence contained
+no execution scenarios or markouts. Do not treat displayed spreads or modeled
+fills as evidence of profit. See the [full trading opportunity audit](./docs/trading-opportunity-audit.md)
+for data limitations and the recommended next step.
+
 ## Requirements
 
 - Node.js 22.12 or newer
