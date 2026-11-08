@@ -9,6 +9,7 @@
   "scripts": {
     "dev": "tsx src/main.ts",
     "start": "tsx src/main.ts",
+    "research:offer-ledger": "tsx src/cli/offer-ledger-poc.ts",
     "typecheck": "tsc --noEmit",
     "test": "vitest run"
   },

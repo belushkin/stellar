@@ -25,6 +25,7 @@ import {
   persistAssetValidation,
   registerTradingPair,
 } from "../src/storage/market-store.js";
+import { compareHorizonCursors, parseHorizonCursor } from "../src/common/horizon-cursor.js";
 
 const pair: TradingPairConfig = {
   base: { type: "native" },
@@ -192,6 +193,140 @@ describe("market observation", () => {
     }
   });
 
+  it("advances the persisted cursor across Horizon compound paging tokens monotonically", () => {
+    const fixture = setup();
+    try {
+      recordObservedTrade({
+        database: fixture.database,
+        trade: createTrade({
+          tradeId: "horizon-cursor-1",
+          cursor: "280717078191775745-2",
+          occurredAtMs: 1_001,
+        }),
+        nowMs: 1_002,
+      });
+      recordObservedTrade({
+        database: fixture.database,
+        trade: createTrade({
+          tradeId: "horizon-cursor-2",
+          cursor: "280717086781706241-3",
+          occurredAtMs: 1_003,
+        }),
+        nowMs: 1_004,
+      });
+      recordObservedTrade({
+        database: fixture.database,
+        trade: createTrade({
+          tradeId: "horizon-cursor-older",
+          cursor: "280717078191775745-8",
+          occurredAtMs: 1_005,
+        }),
+        nowMs: 1_006,
+      });
+      const invalid = recordObservedTrade({
+        database: fixture.database,
+        trade: createTrade({
+          tradeId: "horizon-cursor-invalid",
+          cursor: "280717086781706241-3-extra",
+          occurredAtMs: 1_007,
+        }),
+        nowMs: 1_008,
+      });
+
+      expect(invalid.validationReasons).toContain("trade_cursor_invalid");
+      expect(fixture.database.prepare(`
+        SELECT trade_cursor FROM stream_cursors WHERE pair_id = ?
+      `).get(pairId)).toEqual({ trade_cursor: "280717086781706241-3" });
+      expect(fixture.database.prepare(`
+        SELECT validation_status FROM market_trades WHERE trade_id = 'horizon-cursor-invalid'
+      `).get()).toEqual({ validation_status: "quarantined" });
+    } finally {
+      fixture.database.close();
+    }
+  });
+
+  it("compares Horizon cursor components numerically and rejects malformed tokens", () => {
+    expect(parseHorizonCursor("280717078191775745-2")?.original)
+      .toBe("280717078191775745-2");
+    expect(compareHorizonCursors("280717086781706241-1", "280717078191775745-999"))
+      .toBe(1);
+    expect(compareHorizonCursors("280717078191775745-10", "280717078191775745-2"))
+      .toBe(1);
+    expect(compareHorizonCursors("bad-token", "1")).toBeNull();
+    expect(parseHorizonCursor(`${"9".repeat(129)}-1`)).toBeNull();
+  });
+
+  it("does not advance an unparseable persisted cursor using an unknown ordering", () => {
+    const fixture = setup();
+    try {
+      fixture.database.prepare(`
+        INSERT INTO stream_cursors (pair_id, trade_cursor, updated_at_ms)
+        VALUES (?, 'legacy-invalid-cursor', 1)
+      `).run(pairId);
+      recordObservedTrade({
+        database: fixture.database,
+        trade: createTrade({
+          tradeId: "after-invalid-saved-cursor",
+          cursor: "101",
+          occurredAtMs: 1_001,
+        }),
+        nowMs: 1_002,
+      });
+
+      expect(fixture.database.prepare(`
+        SELECT trade_cursor FROM stream_cursors WHERE pair_id = ?
+      `).get(pairId)).toEqual({ trade_cursor: "legacy-invalid-cursor" });
+    } finally {
+      fixture.database.close();
+    }
+  });
+
+  it("persists original Horizon metadata separately from normalized trade data", () => {
+    const fixture = setup();
+    try {
+      const rawRecord = {
+        paging_token: "280717078191775745-2",
+        base_offer_id: "41",
+        counter_offer_id: "42",
+        ledger_close_time: "2025-01-01T00:00:00Z",
+        _links: { operation: { href: "https://horizon.example/operations/op-1" } },
+      };
+      recordObservedTrade({
+        database: fixture.database,
+        trade: {
+          ...createTrade({
+            tradeId: "metadata-trade",
+            cursor: rawRecord.paging_token,
+            occurredAtMs: 1_001,
+          }),
+          ledgerCloseTime: rawRecord.ledger_close_time,
+          baseOfferId: rawRecord.base_offer_id,
+          counterOfferId: rawRecord.counter_offer_id,
+          operationId: "op-1",
+          transactionHash: "tx-1",
+          horizonRawJson: JSON.stringify(rawRecord),
+        },
+        nowMs: 1_002,
+      });
+
+      expect(fixture.database.prepare(`
+        SELECT ledger_close_time, base_offer_id, counter_offer_id, operation_id,
+          transaction_hash, horizon_raw_json, raw_json
+        FROM market_trades WHERE trade_id = 'metadata-trade'
+      `).get()).toMatchObject({
+        ledger_close_time: rawRecord.ledger_close_time,
+        base_offer_id: "41",
+        counter_offer_id: "42",
+        operation_id: "op-1",
+        transaction_hash: "tx-1",
+        horizon_raw_json: JSON.stringify(rawRecord),
+        raw_json: expect.stringContaining('"tradeId":"metadata-trade"'),
+      });
+    } finally {
+      fixture.database.close();
+    }
+  });
+
   it("quarantines incorrect timestamps without attributing them as executions", () => {
     const fixture = setup();
     try {
@@ -313,7 +448,7 @@ describe("market observation", () => {
         database: fixture.database,
         pairId,
         source: "horizon_sse",
-        cursor: "100",
+        cursor: "280717078191775745-2",
         nowMs: 1_100,
       });
       const gapId = recordTradeStreamGap({
@@ -321,7 +456,7 @@ describe("market observation", () => {
         pairId,
         sessionId,
         source: "horizon_sse",
-        fromCursor: "100",
+        fromCursor: "280717078191775745-2",
         reason: "connection_reset",
         nowMs: 1_200,
       });
@@ -329,38 +464,41 @@ describe("market observation", () => {
         database: fixture.database,
         source: {
           catchUp: async (_pair, cursor, onTrade) => {
-            expect(cursor).toBe("100");
+            expect(cursor).toBe("280717078191775745-2");
             onTrade(createTrade({
               tradeId: "reconnect-recovered",
-              cursor: "101",
+              cursor: "280717086781706241-3",
               occurredAtMs: 1_300,
             }));
-            return { count: 1, lastCursor: "101" };
+            return { count: 1, lastCursor: "280717086781706241-3" };
           },
         },
         pair,
         pairId,
         sessionId,
-        cursor: "100",
+        cursor: "280717078191775745-2",
         nowMs: 1_400,
       });
-      expect(result).toEqual({ count: 1, lastCursor: "101" });
+      expect(result).toEqual({ count: 1, lastCursor: "280717086781706241-3" });
       expect(fixture.database.prepare(`
         SELECT status, recovered_event_count FROM market_data_gaps WHERE gap_id = ?
       `).get(gapId)).toEqual({ status: "resolved", recovered_event_count: 1 });
       expect(fixture.database.prepare(`
         SELECT source, cursor FROM market_trades WHERE trade_id = 'reconnect-recovered'
-      `).get()).toEqual({ source: "horizon_rest_backfill", cursor: "101" });
+      `).get()).toEqual({
+        source: "horizon_rest_backfill",
+        cursor: "280717086781706241-3",
+      });
       expect(fixture.database.prepare(`
         SELECT trade_cursor FROM stream_cursors WHERE pair_id = ?
-      `).get(pairId)).toEqual({ trade_cursor: "101" });
+      `).get(pairId)).toEqual({ trade_cursor: "280717086781706241-3" });
 
       const failedGapId = recordTradeStreamGap({
         database: fixture.database,
         pairId,
         sessionId,
         source: "horizon_sse",
-        fromCursor: "101",
+        fromCursor: "280717086781706241-3",
         reason: "second_disconnect",
         nowMs: 1_500,
       });
@@ -374,7 +512,7 @@ describe("market observation", () => {
         pair,
         pairId,
         sessionId,
-        cursor: "101",
+        cursor: "280717086781706241-3",
         nowMs: 1_600,
       })).rejects.toThrow("Horizon unavailable");
       expect(fixture.database.prepare(`

@@ -125,6 +125,8 @@ export interface ObservationReport {
       horizonSeconds: number;
       sampleSize: number;
       incompleteCount: number;
+      meanSamplingDeviationMs: number | null;
+      maxAbsoluteSamplingDeviationMs: number | null;
       grossMeanQuote: string | null;
       netMeanQuote: string | null;
       netMedianQuote: string | null;
@@ -500,6 +502,7 @@ export function buildObservationReport(input: {
       const markoutDetails = input.database.prepare(`
         SELECT s.pair_id AS pairId, d.strategy_id AS strategyId,
           m.horizon_seconds AS horizonSeconds, m.status,
+          m.sampling_deviation_ms AS samplingDeviationMs,
           m.spread_capture_quote AS spreadCapture,
           m.post_fill_price_movement_quote AS priceMovement,
           m.liquidation_impact_quote AS liquidationImpact,
@@ -514,6 +517,7 @@ export function buildObservationReport(input: {
         strategyId: string;
         horizonSeconds: number;
         status: "complete" | "pending" | "incomplete" | "invalid";
+        samplingDeviationMs: number | null;
         spreadCapture: string | null;
         priceMovement: string | null;
         liquidationImpact: string | null;
@@ -539,12 +543,21 @@ export function buildObservationReport(input: {
           new Big(row.spreadCapture!).plus(row.priceMovement!).plus(row.liquidationImpact!),
         );
         const net = complete.map((row) => new Big(row.net!));
+        const deviations = group
+          .map((row) => row.samplingDeviationMs)
+          .filter((value): value is number => value !== null);
         return {
           pairId,
           strategyId,
           horizonSeconds: Number(horizonSeconds),
           sampleSize: complete.length,
           incompleteCount: group.length - complete.length,
+          meanSamplingDeviationMs: deviations.length === 0
+            ? null
+            : deviations.reduce((total, value) => total + value, 0) / deviations.length,
+          maxAbsoluteSamplingDeviationMs: deviations.length === 0
+            ? null
+            : deviations.reduce((maximum, value) => Math.max(maximum, Math.abs(value)), 0),
           grossMeanQuote: average(gross),
           netMeanQuote: average(net),
           netMedianQuote: percentile(net, 0.5),

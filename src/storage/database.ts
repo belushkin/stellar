@@ -9,6 +9,7 @@ const PAPER_DEPTH_SCHEMA_VERSION = 3;
 const MARKET_OBSERVATION_SCHEMA_VERSION = 4;
 const HISTORICAL_REPLAY_SCHEMA_VERSION = 5;
 const HISTORICAL_REPLAY_DETAILS_SCHEMA_VERSION = 6;
+const HORIZON_METADATA_AND_MARKOUT_REFERENCE_SCHEMA_VERSION = 7;
 
 export function openDatabase(databasePath: string): Database.Database {
   if (databasePath !== ":memory:") {
@@ -616,6 +617,38 @@ export function openDatabase(databasePath: string): Database.Database {
     database
       .prepare("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)")
       .run(HISTORICAL_REPLAY_DETAILS_SCHEMA_VERSION, new Date().toISOString());
+  })();
+
+  database.transaction(() => {
+    const hasHorizonMetadataMigration = database
+      .prepare("SELECT 1 FROM schema_migrations WHERE version = ?")
+      .get(HORIZON_METADATA_AND_MARKOUT_REFERENCE_SCHEMA_VERSION);
+    if (hasHorizonMetadataMigration !== undefined) {
+      return;
+    }
+
+    database.exec(`
+      ALTER TABLE market_trades ADD COLUMN ledger_close_time TEXT;
+      ALTER TABLE market_trades ADD COLUMN base_offer_id TEXT;
+      ALTER TABLE market_trades ADD COLUMN counter_offer_id TEXT;
+      ALTER TABLE market_trades ADD COLUMN base_account TEXT;
+      ALTER TABLE market_trades ADD COLUMN counter_account TEXT;
+      ALTER TABLE market_trades ADD COLUMN base_liquidity_pool_id TEXT;
+      ALTER TABLE market_trades ADD COLUMN counter_liquidity_pool_id TEXT;
+      ALTER TABLE market_trades ADD COLUMN operation_id TEXT;
+      ALTER TABLE market_trades ADD COLUMN transaction_hash TEXT;
+      ALTER TABLE market_trades ADD COLUMN horizon_raw_json TEXT;
+
+      ALTER TABLE research_markout_observations
+        ADD COLUMN fill_reference_snapshot_id INTEGER REFERENCES market_snapshots(id);
+      ALTER TABLE research_markout_observations ADD COLUMN fill_reference_at_ms INTEGER;
+      ALTER TABLE research_markout_observations ADD COLUMN fill_reference_deviation_ms INTEGER;
+      ALTER TABLE research_markout_observations ADD COLUMN fill_reference_time_basis TEXT;
+    `);
+
+    database
+      .prepare("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)")
+      .run(HORIZON_METADATA_AND_MARKOUT_REFERENCE_SCHEMA_VERSION, new Date().toISOString());
   })();
 
   return database;

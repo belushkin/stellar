@@ -2,6 +2,7 @@ node_modules/
 dist/
 coverage/
 data/
+.stellar-offer-ledger-poc/
 .env
 .env.*
 !.env.example

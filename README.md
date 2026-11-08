@@ -133,10 +133,13 @@ inventory cap, and replacement count are configurable through `.env.example`.
 
 Order-book snapshots are stored with local receive timestamps, source, a
 per-pair receive sequence, content hash, and integrity results. Horizon trade
-prints preserve ledger-close time and local receive time, paging cursor, source,
-and validation status. Duplicate trade IDs are ignored; malformed amounts,
-prices, or future timestamps are quarantined. The durable cursor advances only
-after the event is persisted. On restart or reconnect, the runner requests
+prints preserve ledger-close time and local receive time, paging cursor,
+offer/operation/transaction references when supplied, original Horizon
+payload, source, and validation status. Compound Horizon paging tokens are
+compared by numeric components, retained verbatim for requests, and advanced
+monotonically only after the event is persisted. Duplicate trade IDs are
+ignored; malformed cursors, amounts, prices, or future timestamps are
+quarantined. On restart or reconnect, the runner requests
 paginated Horizon trade history from the last committed cursor before resuming
 the stream. Reconnect and recovery failures are recorded as data gaps; gaps
 remain visible until a successful backfill covers them.
@@ -179,13 +182,22 @@ price touch or a public trade as proof of the scanner's execution. It also
 requires snapshot coverage through each scenario's expiry; snapshot intervals
 over five minutes are classified as data gaps. Reported fill fractions are
 scenario outcome bounds, not statistically calibrated probabilities.
+Snapshot queue reductions are not applied as executions or cancellations:
+without attributable event ordering, the queue transition stays uncertain and
+the reduction alone cannot manufacture a lower-bound fill. Delayed public
+trades are applied once as trade evidence, independently of the already-observed
+book change.
 
 Replay markouts are recorded separately at 5 seconds, 30 seconds, 1 minute,
 5 minutes, and 15 minutes. They use the modeled fill price, separate initial
 spread capture from subsequent midpoint movement, and value liquidation using
-opposite-side executable depth. Sampling delay, fees, and missing depth are
-reported per horizon. These are modeled counterfactual results, not paper
-fills or realized trading performance.
+opposite-side executable depth. Spread capture and movement are anchored to
+the latest valid pre-fill book; both that reference timestamp and the actual
+sample timestamp are persisted. Sampling deviation, fees, and missing depth
+are reported per horizon, and markouts are omitted for uncertain scenario
+fills. The current replay model version is `historical_queue_replay_v5`.
+These are modeled counterfactual results, not paper fills or realized trading
+performance.
 
 Portfolio risk valuations use executable liquidation prices, known lot cost
 basis, same-day realized P&L, and simulated costs. Missing or stale books,
@@ -220,5 +232,154 @@ This milestone therefore timestamps snapshots at local receipt and leaves
 `latestLedger` unset; freshness is based on that receive timestamp, not a claim
 about the ledger's age.
 
+## Isolated offer-ledger replay research
+
+The bounded research command downloads a short, contiguous ledger range with
+ledger metadata from the archival Soroban RPC `getLedgers` endpoint, captures
+Horizon books at the first and last ledger boundaries, and writes raw inputs,
+checksums, timestamps, replayed price levels, and a manifest under
+`.stellar-offer-ledger-poc/`. It does not read or write the scanner database.
+The [Horizon order-book endpoint](https://developers.stellar.org/docs/data/apis/horizon/api-reference/retrieve-an-order-book)
+caps each side at 200 levels. The prototype normalizes bid amounts from quote
+units to base units using `price_r`; this interpretation is checked against the
+offer-level ledger metadata in each run.
+Set `STELLAR_RESEARCH_PAIR` to one configured `{ "base": ..., "quote": ... }`
+pair and run:
+
+```sh
+STELLAR_RESEARCH_PAIR='{"base":{"type":"native"},"quote":{"type":"credit","code":"USDC","issuer":"<verified issuer G...>"}}' \
+  npm run research:offer-ledger -- 12
+```
+
+The span must be 2–20 ledgers. The replay applies offer lifecycle changes in
+ledger, transaction, operation, and metadata-change order and compares
+reconstructed aggregate levels with the matching Horizon snapshots. A capped
+Horizon response limits validation to its returned price range; it does not
+validate unseen depth. Any continuity, missing-state, replay, or book mismatch
+is reported and prevents the counterfactual experiment from running.
+Horizon `/order_book` does not report offer counts per price level, and the
+paginated `/offers` endpoint cannot provide a coherent historical snapshot, so
+independent offer-count validation is not claimed.
+
+If validation passes, the command reports illustrative 1-base-unit buy/sell
+scenarios placed after the start ledger. Their lower fill bound remains zero:
+public offer changes do not distinguish executions from cancellations. The
+upper bound assumes gross depletion of pre-existing same-price liquidity
+could have been execution; it is not an actual or confirmed fill, and offer
+IDs do not prove queue priority. This research path neither enables paper
+trading nor signs or submits transactions.
+
+### Offer lifecycle attribution experiment
+
+The separate research classifier in
+[`src/research/offer-attribution.ts`](./src/research/offer-attribution.ts)
+joins each `TransactionResultMetaV1.result.transactionHash` to the matching
+envelope in `LedgerCloseMetaV2.txSet` by hashing the envelope for the public
+network. It does not assume transaction-set order equals apply order. It then
+correlates the operation-indexed transaction result with the corresponding
+operation metadata changes.
+
+Execution is classified only when an order-book `ClaimAtom` identifies the
+same seller and offer ID, its selling/buying assets match the prior offer, and
+the sum of positive `amountSold` values exactly accounts for the observed
+quantity reduction. The classifier reads `ManageSellOffer`,
+`ManageBuyOffer`, and `CreatePassiveSellOffer` result `offersClaimed`, plus
+`PathPaymentStrictReceive` / `PathPaymentStrictSend` success `offers`.
+`ClaimOfferAtomV0` is normalized from its `sellerEd25519` bytes; liquidity-pool
+claims are not attributed to offers. A mismatch or unlinked reduction remains
+unresolved and cannot yield an execution amount.
+
+A matching successful zero-amount `ManageSellOffer` or `ManageBuyOffer`
+operation with a deleted result identifies explicit cancellation. A nonzero
+operation that updates the same existing offer is classified as modification
+only when the successful result matches the resulting ledger offer. A
+successful `AccountMerge` is not treated as an offer-removal cause: offer
+entries are account subentries, and Stellar rejects merging an account that
+still has subentries. Unmatched removals remain unresolved. Classic
+`OfferEntry` has no expiration field, so this experiment does not classify
+offer expiry.
+
+The compressed deterministic test fixture is a reduced extract of four real
+transactions from public ledger 65,361,494, preserved with their XDR envelopes
+and transaction metadata: transaction indices 4 (an offer amount modification
+with no claims), 30 (zero-amount cancellation), 65 (an exact partial claim),
+and 97 (a fully consumed offer). These cases validate causal attribution, not
+historical market reconstruction or hypothetical queue priority. The
+classifier is research-only, currently requires `LedgerCloseMetaV2` and the
+public-network hash, and is not wired into the scanner or replay fill model.
+
 No wallet or secret-key setting exists. The program has no transaction
 signing, transaction submission, or real-trading path.
+
+### Price-time priority replay experiment
+
+The isolated implementation is in
+[`src/research/offer-priority-replay.ts`](./src/research/offer-priority-replay.ts).
+It orders offers within an asset direction using Stellar Core's price
+comparison and ascending offer ID tie-break. Core's pinned implementation
+documents that lower IDs take precedence at an equal price and that this
+ordering gives older offers precedence
+([`LedgerTxnOfferSQL.cpp`](https://github.com/stellar/stellar-core/blob/362dbc5184c5fdc0d6e898f3046639dc5e2a4f32/src/ledger/LedgerTxnOfferSQL.cpp#L77-L90),
+[`isBetterOffer`](https://github.com/stellar/stellar-core/blob/362dbc5184c5fdc0d6e898f3046639dc5e2a4f32/src/ledger/LedgerTxnOfferSQL.cpp#L168-L182)).
+New offers get an ID by incrementing the ledger header's global `idPool`;
+modifications reuse `mOfferID`
+([`ManageOfferOpFrameBase.cpp`](https://github.com/stellar/stellar-core/blob/362dbc5184c5fdc0d6e898f3046639dc5e2a4f32/src/transactions/ManageOfferOpFrameBase.cpp#L527-L532),
+[`buildOffer`](https://github.com/stellar/stellar-core/blob/362dbc5184c5fdc0d6e898f3046639dc5e2a4f32/src/transactions/ManageOfferOpFrameBase.cpp#L587-L593),
+[`TransactionUtils.cpp`](https://github.com/stellar/stellar-core/blob/362dbc5184c5fdc0d6e898f3046639dc5e2a4f32/src/transactions/TransactionUtils.cpp#L747-L749)).
+Consequently, a same-price amount update keeps its rank, while a repricing
+moves the offer to its new price rank but retains its ID as the tie-breaker.
+Offer IDs are not timestamps; this conclusion depends on the Core comparator
+and allocator semantics, not on treating an ID as standalone time evidence.
+Core's comparator uses a `double` ratio and its SQL order uses a 15-digit
+approximation; the prototype mirrors the comparator's numeric division and
+does not validate pathological near-equal ratios that round differently in
+those two paths.
+
+The deterministic fixture
+[`tests/fixtures/offer-priority-ledgers.json.gz`](./tests/fixtures/offer-priority-ledgers.json.gz)
+contains selected, checksum-verified metadata from continuous archival samples.
+Tests cover:
+
+- Two LIL/XLM offers at one price, created by the same seller in ledgers
+  65,374,575 (transaction 65, offer 1,865,203,943) and 65,374,576
+  (transaction 74, offer 1,865,203,951). The earlier/lower ID remains first;
+  both are present when the second joins the level.
+- Two AQUA/USDC offers at the same price in ledger 65,374,634, transactions
+  141 and 160 (IDs 1,865,204,325 and 1,865,204,327).
+- XLM/USDC same-price amount modification, repricing, an exact partial
+  execution claim, amount increase, cancellation, and cancellation followed by
+  recreation with a different ID.
+- Missing ledger sequence, regressed event ordering, inconsistent offer
+  transitions, multiple operation-ordered offer changes in one real
+  transaction, and deterministic replay.
+
+The XLM/USDC sample spans boundary ledgers 65,374,565–65,374,585; its 20
+metadata ledgers are continuous, use protocol 29 with
+`LedgerCloseMetaV2`/`TransactionMetaV4`, and include 1,534 pair offer changes.
+The prototype has not been validated against other protocol versions. The
+Horizon comparison passed for 200 bid and 200 ask price levels at the matching
+end ledger, but each side reached Horizon's 200-level cap and no offer counts
+were available. A prior 20-ledger XLM/USDC sample failed its book comparison
+with six level mismatches. The supplemental LIL/XLM sample at boundaries
+65,374,630–65,374,650 passed a 13-bid/27-ask comparison but contained no offer
+changes for that pair. The LIL/XLM and AQUA/USDC edge-case events are therefore
+not independently validated against pair-specific snapshots at their event
+ledgers.
+
+`replayOfferPriorityRange` rejects sequence gaps and inconsistent state; its
+coverage is explicitly limited to offer events present in the supplied
+metadata. It does not claim that the changed-offer subset is the complete
+historical book. `insertHypotheticalOffer` returns an uncertain result unless
+the caller supplies a complete boundary book and identifies the hypothetical
+order as the first global ID-allocating operation in the next ledger. Under
+those assumptions it uses the boundary `idPool + 1`; it does not calculate fills,
+profitability, or counterfactual effects on subsequent transactions. It also
+fails closed for marketable orders and unspecified within-ledger insertion.
+
+This validates Core's tie-break behavior, not a complete historical
+counterfactual fill model. Horizon's aggregate order book does not supply
+offer-level IDs, counts, or a historical complete offer state, and replaying
+later observed transactions unchanged would not model how they might have
+interacted with a hypothetical order. No production scanner, database,
+strategy, collector, paper-trading path, or transaction-submission path uses
+this research code.

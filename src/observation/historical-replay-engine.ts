@@ -2,10 +2,11 @@ import { createHash } from "node:crypto";
 import type Database from "better-sqlite3";
 
 import { Big } from "../common/decimal.js";
+import { compareHorizonCursors } from "../common/horizon-cursor.js";
 import { estimateExecutableVolume } from "../order-book/executable-volume.js";
 import type { OrderBookSnapshot } from "../order-book/types.js";
 
-export const HISTORICAL_REPLAY_MODEL_VERSION = "historical_queue_replay_v4";
+export const HISTORICAL_REPLAY_MODEL_VERSION = "historical_queue_replay_v5";
 export const REPLAY_MARKOUT_HORIZONS_SECONDS = [5, 30, 60, 300, 900] as const;
 export const REPLAY_EXECUTION_MODE = "independent_counterfactual" as const;
 const TRADE_EVENT_TIME_SAFETY_MS = 1_000;
@@ -106,6 +107,9 @@ interface ScenarioResult {
 interface MarkoutResult {
   fill: FillEvent;
   horizonSeconds: number;
+  fillReferenceSnapshot: SnapshotRow | null;
+  fillReferenceAtMs: number | null;
+  fillReferenceDeviationMs: number | null;
   targetAtMs: number;
   sampledSnapshot: SnapshotRow | null;
   sampledAtMs: number | null;
@@ -189,25 +193,7 @@ function queueAtPrice(book: OrderBookSnapshot, side: "buy" | "sell", limitPrice:
 }
 
 function compareCursor(left: string, right: string): number | null {
-  if (left === right) {
-    return 0;
-  }
-  const leftParts = left.split("-");
-  const rightParts = right.split("-");
-  if (
-    leftParts.length === rightParts.length
-    && leftParts.every((part) => /^\d+$/.test(part))
-    && rightParts.every((part) => /^\d+$/.test(part))
-  ) {
-    for (let index = 0; index < leftParts.length; index += 1) {
-      const a = BigInt(leftParts[index] ?? "0");
-      const b = BigInt(rightParts[index] ?? "0");
-      if (a !== b) {
-        return a < b ? -1 : 1;
-      }
-    }
-  }
-  return null;
+  return compareHorizonCursors(left, right);
 }
 
 function maxBig(left: Big, right: Big): Big {
@@ -295,7 +281,7 @@ function loadInputs(database: Database.Database): {
       base_is_seller AS baseIsSeller, trade_type AS tradeType,
       validation_status AS validationStatus
     FROM market_trades
-    ORDER BY pair_id, received_at_ms, received_sequence, cursor, trade_id
+    ORDER BY pair_id, received_at_ms, received_sequence, trade_id
   `).all() as TradeRow[];
   const gaps = database.prepare(`
     SELECT pair_id AS pairId, detected_at_ms AS detectedAtMs,
@@ -379,6 +365,7 @@ function eventsForScenario(
         && leftSequence !== rightSequence) {
         return leftSequence - rightSequence;
       }
+      return 0;
     } else if (left.kind === "snapshot" && right.kind === "snapshot") {
       const leftSequence = left.snapshot?.receivedSequence;
       const rightSequence = right.snapshot?.receivedSequence;
@@ -389,7 +376,7 @@ function eventsForScenario(
       }
       return (left.snapshot?.id ?? 0) - (right.snapshot?.id ?? 0);
     }
-    return left.key.localeCompare(right.key);
+    return 0;
   });
   return events;
 }
@@ -421,23 +408,88 @@ function calculateMarkouts(input: {
   if (!fillBase.gt(0)) {
     return [];
   }
-  const placementBook = parseBook(input.candidate.snapshotJson);
-  const midpoint = placementBook.bestBid !== null && placementBook.bestAsk !== null
-    ? new Big(placementBook.bestBid).plus(placementBook.bestAsk).div(2)
-    : null;
+  const referenceIndex = firstIndexAfter(
+    input.snapshots,
+    input.fill.trade.occurredAtMs,
+    (snapshot) => snapshot.receivedAtMs,
+  ) - 1;
+  const fillReferenceSnapshot = input.snapshots[referenceIndex] ?? null;
+  const fillReferenceAtMs = fillReferenceSnapshot?.receivedAtMs ?? null;
+  const fillReferenceDeviationMs = fillReferenceAtMs === null
+    ? null
+    : input.fill.trade.occurredAtMs - fillReferenceAtMs;
+  let midpoint: Big | null = null;
+  if (fillReferenceSnapshot?.integrityStatus === "valid") {
+    const fillReferenceBook = parseBook(fillReferenceSnapshot.snapshotJson);
+    midpoint = fillReferenceBook.bestBid !== null && fillReferenceBook.bestAsk !== null
+      ? new Big(fillReferenceBook.bestBid).plus(fillReferenceBook.bestAsk).div(2)
+      : null;
+  }
+  let referenceUnavailableReason: string | null = null;
+  if (!fillReferenceSnapshot) {
+    referenceUnavailableReason = "no_pre_fill_reference_snapshot";
+  } else if (fillReferenceSnapshot.integrityStatus !== "valid") {
+    referenceUnavailableReason = "fill_reference_snapshot_integrity_rejected";
+  } else if (
+    fillReferenceDeviationMs !== null
+    && fillReferenceDeviationMs > MAX_ORDER_BOOK_SNAPSHOT_GAP_MS
+  ) {
+    referenceUnavailableReason = "pre_fill_reference_snapshot_too_old";
+  } else if (midpoint === null) {
+    referenceUnavailableReason = "fill_reference_snapshot_requires_two_sided_book";
+  }
   const results: MarkoutResult[] = [];
   for (const horizonSeconds of REPLAY_MARKOUT_HORIZONS_SECONDS) {
     const targetAtMs = input.fill.trade.occurredAtMs + horizonSeconds * 1000;
+    if (referenceUnavailableReason !== null || midpoint === null) {
+      results.push({
+        fill: input.fill,
+        horizonSeconds,
+        fillReferenceSnapshot,
+        fillReferenceAtMs,
+        fillReferenceDeviationMs,
+        targetAtMs,
+        sampledSnapshot: null,
+        sampledAtMs: null,
+        deviationMs: null,
+        status: "incomplete",
+        spreadCaptureQuote: null,
+        priceMovementQuote: null,
+        liquidationImpactQuote: null,
+        feesQuote: null,
+        netQuote: null,
+        reasons: [referenceUnavailableReason ?? "fill_reference_price_unavailable"],
+      });
+      continue;
+    }
     const firstEligibleIndex = firstIndexAtOrAfter(
       input.snapshots,
       targetAtMs,
       (snapshot) => snapshot.receivedAtMs,
     );
     const possibleSample = input.snapshots[firstEligibleIndex];
-    const sampled = possibleSample
-      && possibleSample.receivedAtMs <= targetAtMs + input.maxSampleDelayMs
-      ? possibleSample
-      : null;
+    if (possibleSample && possibleSample.receivedAtMs > targetAtMs + input.maxSampleDelayMs) {
+      results.push({
+        fill: input.fill,
+        horizonSeconds,
+        fillReferenceSnapshot,
+        fillReferenceAtMs,
+        fillReferenceDeviationMs,
+        targetAtMs,
+        sampledSnapshot: possibleSample,
+        sampledAtMs: possibleSample.receivedAtMs,
+        deviationMs: possibleSample.receivedAtMs - targetAtMs,
+        status: "invalid",
+        spreadCaptureQuote: null,
+        priceMovementQuote: null,
+        liquidationImpactQuote: null,
+        feesQuote: null,
+        netQuote: null,
+        reasons: ["markout_sample_exceeds_sampling_tolerance"],
+      });
+      continue;
+    }
+    const sampled = possibleSample ?? null;
     if (!sampled) {
       const status = input.latestObservedAtMs >= targetAtMs + input.maxSampleDelayMs
         ? "incomplete"
@@ -445,6 +497,9 @@ function calculateMarkouts(input: {
       results.push({
         fill: input.fill,
         horizonSeconds,
+        fillReferenceSnapshot,
+        fillReferenceAtMs,
+        fillReferenceDeviationMs,
         targetAtMs,
         sampledSnapshot: null,
         sampledAtMs: null,
@@ -455,7 +510,9 @@ function calculateMarkouts(input: {
         liquidationImpactQuote: null,
         feesQuote: null,
         netQuote: null,
-        reasons: [status === "pending" ? "markout_horizon_not_yet_observed" : "no_snapshot_within_sampling_tolerance"],
+        reasons: [status === "pending"
+          ? "markout_horizon_not_yet_observed"
+          : "no_snapshot_within_sampling_tolerance"],
       });
       continue;
     }
@@ -465,6 +522,9 @@ function calculateMarkouts(input: {
       results.push({
         fill: input.fill,
         horizonSeconds,
+        fillReferenceSnapshot,
+        fillReferenceAtMs,
+        fillReferenceDeviationMs,
         targetAtMs,
         sampledSnapshot: sampled,
         sampledAtMs,
@@ -484,6 +544,9 @@ function calculateMarkouts(input: {
       results.push({
         fill: input.fill,
         horizonSeconds,
+        fillReferenceSnapshot,
+        fillReferenceAtMs,
+        fillReferenceDeviationMs,
         targetAtMs,
         sampledSnapshot: sampled,
         sampledAtMs,
@@ -514,6 +577,9 @@ function calculateMarkouts(input: {
       results.push({
         fill: input.fill,
         horizonSeconds,
+        fillReferenceSnapshot,
+        fillReferenceAtMs,
+        fillReferenceDeviationMs,
         targetAtMs,
         sampledSnapshot: sampled,
         sampledAtMs,
@@ -542,6 +608,9 @@ function calculateMarkouts(input: {
       results.push({
         fill: input.fill,
         horizonSeconds,
+        fillReferenceSnapshot,
+        fillReferenceAtMs,
+        fillReferenceDeviationMs,
         targetAtMs,
         sampledSnapshot: sampled,
         sampledAtMs,
@@ -560,6 +629,9 @@ function calculateMarkouts(input: {
     results.push({
       fill: input.fill,
       horizonSeconds,
+      fillReferenceSnapshot,
+      fillReferenceAtMs,
+      fillReferenceDeviationMs,
       targetAtMs,
       sampledSnapshot: sampled,
       sampledAtMs,
@@ -691,25 +763,19 @@ function replayScenario(input: {
         continue;
       }
       const queues = queueAtPrice(nextBook, candidate.side, candidate.limitPrice);
-      const betterReduction = previousQueues.better.minus(queues.better).gt(0)
-        ? previousQueues.better.minus(queues.better)
-        : new Big(0);
-      const samePriceReduction = previousQueues.same.minus(queues.same).gt(0)
-        ? previousQueues.same.minus(queues.same)
-        : new Big(0);
-      const lowerAfterCancellations = queueLower.minus(betterReduction).minus(samePriceReduction).gt(0)
-        ? queueLower.minus(betterReduction).minus(samePriceReduction)
-        : new Big(0);
-      queueLower = maxBig(queues.better, lowerAfterCancellations);
-      queueUpper = maxBig(
-        queues.better,
-        minBig(queueUpper, queues.better.plus(queues.same).plus(hiddenQueueAllowance)),
-      );
       if (queues.same.gt(previousQueues.same)) {
         reasons.add("new_same_price_liquidity_ordering_uncertain");
       }
       if (!queues.better.eq(previousQueues.better) || !queues.same.eq(previousQueues.same)) {
         reasons.add("queue_change_between_snapshots_is_attribution_ambiguous");
+        queueLower = maxBig(
+          queueLower,
+          queues.better.plus(minBig(previousQueues.same, queues.same)),
+        );
+        queueUpper = maxBig(
+          queueUpper,
+          queues.better.plus(queues.same).plus(hiddenQueueAllowance),
+        );
       }
       previousQueues = queues;
       continue;
@@ -721,6 +787,29 @@ function replayScenario(input: {
     if (trade.validationStatus !== "valid") {
       reasons.add("unvalidated_orderbook_trade_during_scenario");
       continue;
+    }
+    const matchingSide = candidate.side === "buy"
+      ? trade.baseIsSeller === 1
+      : trade.baseIsSeller === 0;
+    if (!matchingSide) {
+      continue;
+    }
+    const price = new Big(trade.priceNumerator).div(trade.priceDenominator);
+    const limit = new Big(candidate.limitPrice);
+    const exact = price.eq(limit);
+    const through = candidate.side === "buy" ? price.lt(limit) : price.gt(limit);
+    if (!exact && !through) {
+      continue;
+    }
+    if (candidate.cursor !== null && candidate.cursor !== "now") {
+      const cursorOrder = compareCursor(trade.cursor, candidate.cursor);
+      if (cursorOrder === null) {
+        reasons.add("trade_cursor_ordering_ambiguous");
+        continue;
+      }
+      if (cursorOrder <= 0) {
+        continue;
+      }
     }
     if (
       !Number.isSafeInteger(trade.occurredAtMs)
@@ -751,37 +840,11 @@ function replayScenario(input: {
       continue;
     }
     priorTradeEventAtMs = trade.occurredAtMs;
-    if (trade.occurredAtMs <= candidate.placementAtMs) {
-      if (trade.receivedAtMs > candidate.placementAtMs) {
-        reasons.add("trade_event_time_not_after_placement");
-      }
+    if (trade.occurredAtMs < candidate.placementAtMs - TRADE_EVENT_TIME_SAFETY_MS) {
       continue;
     }
-    if (trade.occurredAtMs - candidate.placementAtMs <= TRADE_EVENT_TIME_SAFETY_MS) {
+    if (Math.abs(trade.occurredAtMs - candidate.placementAtMs) <= TRADE_EVENT_TIME_SAFETY_MS) {
       reasons.add("ledger_close_time_precision_makes_ordering_ambiguous");
-      continue;
-    }
-    if (candidate.cursor !== null) {
-      const cursorOrder = compareCursor(trade.cursor, candidate.cursor);
-      if (cursorOrder === null) {
-        reasons.add("trade_cursor_ordering_ambiguous");
-        continue;
-      }
-      if (cursorOrder <= 0) {
-        continue;
-      }
-    }
-    const matchingSide = candidate.side === "buy"
-      ? trade.baseIsSeller === 1
-      : trade.baseIsSeller === 0;
-    if (!matchingSide) {
-      continue;
-    }
-    const price = new Big(trade.priceNumerator).div(trade.priceDenominator);
-    const limit = new Big(candidate.limitPrice);
-    const exact = price.eq(limit);
-    const through = candidate.side === "buy" ? price.lt(limit) : price.gt(limit);
-    if (!exact && !through) {
       continue;
     }
 
@@ -855,7 +918,6 @@ function replayScenario(input: {
     || reason.includes("uncertain")
     || reason.includes("out_of_order")
     || reason === "price_through_fill_is_counterfactual"
-    || reason === "trade_event_time_not_after_placement"
     || reason === "trade_cursor_ordering_ambiguous",
   );
   let status: ScenarioResult["status"];
@@ -891,7 +953,11 @@ function replayScenario(input: {
   }
 
   const markouts = events
-    .filter((event) => event.lower.gt(0))
+    .filter((event) =>
+      evidenceQuality === "sufficient"
+      && event.lower.gt(0)
+      && event.classification === "modeled_fill_estimate",
+    )
     .flatMap((fill) => calculateMarkouts({
       candidate,
       fill,
@@ -993,8 +1059,10 @@ function persistScenario(database: Database.Database, runId: string, result: Sce
         sampled_snapshot_id, sampled_at_ms, sampling_deviation_ms, status,
         fill_base, fill_price, spread_capture_quote,
         post_fill_price_movement_quote, liquidation_impact_quote,
-        estimated_fees_quote, net_markout_quote, quality_reasons_json
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        estimated_fees_quote, net_markout_quote, quality_reasons_json,
+        fill_reference_snapshot_id, fill_reference_at_ms,
+        fill_reference_deviation_ms, fill_reference_time_basis
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
     for (const markout of result.markouts) {
       insertMarkout.run(
@@ -1014,6 +1082,10 @@ function persistScenario(database: Database.Database, runId: string, result: Sce
         markout.feesQuote,
         markout.netQuote,
         JSON.stringify(markout.reasons),
+        markout.fillReferenceSnapshot?.id ?? null,
+        markout.fillReferenceAtMs,
+        markout.fillReferenceDeviationMs,
+        markout.fillReferenceSnapshot ? "snapshot_receive_time_vs_ledger_close_time" : null,
       );
     }
   })();

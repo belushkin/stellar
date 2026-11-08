@@ -192,7 +192,7 @@ function createFixture(): {
       options.priceDenominator ?? "1",
       options.baseIsSeller ?? 1,
       receivedAtMs,
-      Number(cursor.split("-")[0]),
+      Number(cursor.split("-").at(-1)),
       options.validationStatus ?? "valid",
     );
   };
@@ -324,6 +324,33 @@ describe("HistoricalReplayEngine", () => {
     }
   });
 
+  it("does not double-count a delayed trade already reflected in a snapshot", () => {
+    const fixture = createFixture();
+    try {
+      fixture.addCandidate({ visibleQueue: "5", queueLower: "5", queueUpper: "5" });
+      fixture.addSnapshot(
+        PLACEMENT_AT + 2_000,
+        makeBook(PLACEMENT_AT + 2_000, [{ price: "1", amount: "2" }]),
+      );
+      fixture.addTrade({
+        occurredAtMs: PLACEMENT_AT + 1_500,
+        receivedAtMs: PLACEMENT_AT + 4_000,
+        baseAmount: "3",
+      });
+      finishCoverage(fixture.addSnapshot);
+
+      new HistoricalReplayEngine(fixture.database).run();
+      expect(fixture.database.prepare(`
+        SELECT estimated_fill_lower_base AS lower FROM research_execution_scenarios
+      `).get()).toEqual({ lower: "0" });
+      expect(fixture.database.prepare(`
+        SELECT estimated_fill_upper_base AS upper FROM research_execution_scenarios
+      `).get()).toEqual({ upper: "0" });
+    } finally {
+      fixture.database.close();
+    }
+  });
+
   it("treats new same-price liquidity as queue uncertainty", () => {
     const fixture = createFixture();
     try {
@@ -439,6 +466,110 @@ describe("HistoricalReplayEngine", () => {
     }
   });
 
+  it("does not call a ledger-close time well before placement ambiguous", () => {
+    const fixture = createFixture();
+    try {
+      fixture.addCandidate();
+      fixture.addTrade({
+        occurredAtMs: PLACEMENT_AT - 3_000,
+        receivedAtMs: PLACEMENT_AT + 3_500,
+      });
+      finishCoverage(fixture.addSnapshot);
+
+      const summary = new HistoricalReplayEngine(fixture.database).run();
+      expect(summary.scenarioStatuses.no_fill_evidence).toBe(1);
+      expect(fixture.database.prepare(`
+        SELECT quality_reasons_json AS reasons FROM research_execution_scenarios
+      `).get()).toMatchObject({
+        reasons: expect.not.stringContaining("trade_event_time_not_after_placement"),
+      });
+    } finally {
+      fixture.database.close();
+    }
+  });
+
+  it("does not attach pre-placement timestamp uncertainty to wrong-side or wrong-price trades", () => {
+    for (const trade of [
+      { baseIsSeller: 0 as const, priceNumerator: "1", priceDenominator: "1" },
+      { baseIsSeller: 1 as const, priceNumerator: "2", priceDenominator: "1" },
+    ]) {
+      const fixture = createFixture();
+      try {
+        fixture.addCandidate();
+        fixture.addTrade({
+          ...trade,
+          occurredAtMs: PLACEMENT_AT - 3_000,
+          receivedAtMs: PLACEMENT_AT + 3_500,
+        });
+        finishCoverage(fixture.addSnapshot);
+
+        const summary = new HistoricalReplayEngine(fixture.database).run();
+        expect(summary.scenarioStatuses.no_fill_evidence).toBe(1);
+        expect(fixture.database.prepare(`
+          SELECT quality_reasons_json AS reasons FROM research_execution_scenarios
+        `).get()).toMatchObject({
+          reasons: expect.not.stringContaining("ledger_close_time_precision_makes_ordering_ambiguous"),
+        });
+      } finally {
+        fixture.database.close();
+      }
+    }
+  });
+
+  it("classifies relevant same-ledger trades as uncertain and later trades as eligible", () => {
+    const ambiguous = createFixture();
+    try {
+      ambiguous.addCandidate();
+      ambiguous.addTrade({
+        occurredAtMs: PLACEMENT_AT + 500,
+        receivedAtMs: PLACEMENT_AT + 1_500,
+      });
+      finishCoverage(ambiguous.addSnapshot);
+
+      const summary = new HistoricalReplayEngine(ambiguous.database).run();
+      expect(summary.scenarioStatuses.uncertain).toBe(1);
+      expect(ambiguous.database.prepare(`
+        SELECT COUNT(*) AS count FROM research_execution_events
+      `).get()).toEqual({ count: 0 });
+    } finally {
+      ambiguous.database.close();
+    }
+
+    const eligible = createFixture();
+    try {
+      eligible.addCandidate();
+      eligible.addTrade({
+        occurredAtMs: PLACEMENT_AT + 2_000,
+        receivedAtMs: PLACEMENT_AT + 2_500,
+        baseAmount: "6",
+      });
+      finishCoverage(eligible.addSnapshot);
+
+      const summary = new HistoricalReplayEngine(eligible.database).run();
+      expect(summary.scenarioStatuses.partial_fill).toBe(1);
+    } finally {
+      eligible.database.close();
+    }
+  });
+
+  it("uses the ledger-close guard for scenarios whose starting cursor is now", () => {
+    const fixture = createFixture();
+    try {
+      fixture.addCandidate({ cursor: "now" });
+      fixture.addTrade({
+        occurredAtMs: PLACEMENT_AT + 2_000,
+        receivedAtMs: PLACEMENT_AT + 2_500,
+        baseAmount: "6",
+      });
+      finishCoverage(fixture.addSnapshot);
+
+      const summary = new HistoricalReplayEngine(fixture.database).run();
+      expect(summary.scenarioStatuses.partial_fill).toBe(1);
+    } finally {
+      fixture.database.close();
+    }
+  });
+
   it("marks invalid event timestamps incomplete instead of using them as fill evidence", () => {
     const fixture = createFixture();
     try {
@@ -521,7 +652,10 @@ describe("HistoricalReplayEngine", () => {
     try {
       fixture.addCandidate();
       fixture.addTrade({ baseAmount: "6" });
-      fixture.addSnapshot(PLACEMENT_AT + 9_000);
+      fixture.addSnapshot(
+        PLACEMENT_AT + 9_000,
+        makeBook(PLACEMENT_AT + 9_000, [{ price: "0.99", amount: "5" }]),
+      );
       finishCoverage(fixture.addSnapshot);
 
       const summary = new HistoricalReplayEngine(fixture.database).run();
@@ -531,7 +665,11 @@ describe("HistoricalReplayEngine", () => {
       });
       expect(fixture.database.prepare(`
         SELECT horizon_seconds AS horizon, status, fill_price AS price,
-          sampled_at_ms AS sampledAt, sampling_deviation_ms AS deviation
+          sampled_at_ms AS sampledAt, sampling_deviation_ms AS deviation,
+          fill_reference_snapshot_id AS referenceSnapshotId,
+          fill_reference_at_ms AS referenceAt,
+          fill_reference_deviation_ms AS referenceDeviation,
+          fill_reference_time_basis AS referenceTimeBasis
         FROM research_markout_observations WHERE horizon_seconds = 5
       `).get()).toMatchObject({
         horizon: 5,
@@ -539,6 +677,10 @@ describe("HistoricalReplayEngine", () => {
         price: "1",
         sampledAt: PLACEMENT_AT + 9_000,
         deviation: 1_000,
+        referenceSnapshotId: expect.any(Number),
+        referenceAt: PLACEMENT_AT - 1_000,
+        referenceDeviation: 4_000,
+        referenceTimeBasis: "snapshot_receive_time_vs_ledger_close_time",
       });
       expect(summary.markoutsByHorizon).toHaveLength(5);
       expect(buildObservationReport({
@@ -550,10 +692,99 @@ describe("HistoricalReplayEngine", () => {
           strategyId: "passive_maker",
           horizonSeconds: 5,
           sampleSize: 1,
-          grossMeanQuote: "0",
-          netMeanQuote: "-0.01",
+          meanSamplingDeviationMs: 1_000,
+          maxAbsoluteSamplingDeviationMs: 1_000,
+          grossMeanQuote: "-0.01",
+          netMeanQuote: "-0.02",
         }),
       );
+    } finally {
+      fixture.database.close();
+    }
+  });
+
+  it("anchors markout spread capture and movement to the fill-time reference book", () => {
+    const fixture = createFixture();
+    try {
+      fixture.addCandidate();
+      fixture.addSnapshot(
+        PLACEMENT_AT + 2_000,
+        makeBook(
+          PLACEMENT_AT + 2_000,
+          [{ price: "1", amount: "5" }],
+          [{ price: "1.3", amount: "5" }],
+        ),
+      );
+      fixture.addTrade({ baseAmount: "6" });
+      fixture.addSnapshot(
+        PLACEMENT_AT + 9_000,
+        makeBook(
+          PLACEMENT_AT + 9_000,
+          [{ price: "0.99", amount: "5" }],
+          [{ price: "1.3", amount: "5" }],
+        ),
+      );
+      finishCoverage(fixture.addSnapshot);
+
+      new HistoricalReplayEngine(fixture.database).run();
+      expect(fixture.database.prepare(`
+        SELECT spread_capture_quote AS spread,
+          post_fill_price_movement_quote AS movement,
+          fill_reference_at_ms AS referenceAt,
+          fill_reference_deviation_ms AS referenceDeviation
+        FROM research_markout_observations WHERE horizon_seconds = 5
+      `).get()).toEqual({
+        spread: "0.15",
+        movement: "-0.005",
+        referenceAt: PLACEMENT_AT + 2_000,
+        referenceDeviation: 1_000,
+      });
+    } finally {
+      fixture.database.close();
+    }
+  });
+
+  it("does not create markouts for uncertain price-through evidence", () => {
+    const fixture = createFixture();
+    try {
+      fixture.addCandidate();
+      fixture.addTrade({
+        priceNumerator: "9",
+        priceDenominator: "10",
+        baseAmount: "100",
+      });
+      finishCoverage(fixture.addSnapshot);
+
+      new HistoricalReplayEngine(fixture.database).run();
+      expect(fixture.database.prepare(`
+        SELECT COUNT(*) AS count FROM research_markout_observations
+      `).get()).toEqual({ count: 0 });
+    } finally {
+      fixture.database.close();
+    }
+  });
+
+  it("does not create markouts from a lower-bound fill in an uncertain scenario", () => {
+    const fixture = createFixture();
+    try {
+      fixture.addCandidate();
+      fixture.addSnapshot(
+        PLACEMENT_AT + 2_000,
+        makeBook(PLACEMENT_AT + 2_000, [{ price: "1", amount: "2" }]),
+      );
+      fixture.addTrade({
+        occurredAtMs: PLACEMENT_AT + 5_000,
+        receivedAtMs: PLACEMENT_AT + 6_000,
+        baseAmount: "6",
+      });
+      finishCoverage(fixture.addSnapshot);
+
+      const summary = new HistoricalReplayEngine(fixture.database).run();
+      expect(summary.scenarioStatuses.uncertain).toBe(1);
+      expect(summary.fillEvidence.scenariosWithLowerBoundFill).toBe(1);
+      expect(fixture.database.prepare(`
+        SELECT COUNT(*) AS count FROM research_markout_observations
+      `).get()).toEqual({ count: 0 });
     } finally {
       fixture.database.close();
     }
@@ -602,7 +833,10 @@ describe("HistoricalReplayEngine", () => {
     try {
       fixture.addCandidate();
       fixture.addTrade({ baseAmount: "6" });
-      fixture.addSnapshot(PLACEMENT_AT + 16_000);
+      fixture.addSnapshot(
+        PLACEMENT_AT + 16_000,
+        makeBook(PLACEMENT_AT + 16_000, [{ price: "0.99", amount: "5" }]),
+      );
       finishCoverage(fixture.addSnapshot);
 
       const summary = new HistoricalReplayEngine(fixture.database, {
@@ -610,8 +844,29 @@ describe("HistoricalReplayEngine", () => {
       }).run();
       expect(summary.markoutsByHorizon[0]).toMatchObject({
         horizonSeconds: 5,
-        incomplete: 1,
+        invalid: 1,
       });
+      expect(fixture.database.prepare(`
+        SELECT sampled_at_ms AS sampledAt, sampling_deviation_ms AS deviation,
+          status, quality_reasons_json AS reasons
+        FROM research_markout_observations WHERE horizon_seconds = 5
+      `).get()).toEqual({
+        sampledAt: PLACEMENT_AT + 16_000,
+        deviation: 8_000,
+        status: "invalid",
+        reasons: '["markout_sample_exceeds_sampling_tolerance"]',
+      });
+      expect(buildObservationReport({
+        database: fixture.database,
+        portfolioId: "default",
+      }).historicalReplay?.markoutDistributionsByPairStrategyHorizon).toContainEqual(
+        expect.objectContaining({
+          horizonSeconds: 5,
+          sampleSize: 0,
+          meanSamplingDeviationMs: 8_000,
+          maxAbsoluteSamplingDeviationMs: 8_000,
+        }),
+      );
     } finally {
       fixture.database.close();
     }

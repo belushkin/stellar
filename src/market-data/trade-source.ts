@@ -4,6 +4,7 @@ import type { AppConfig, TradingPairConfig } from "../config/schema.js";
 import { createLogger } from "../common/logger.js";
 import { withRetry } from "../common/retry.js";
 import { isRetryableHorizonError } from "../stellar/horizon-client.js";
+import { compareHorizonCursors, parseHorizonCursor } from "../common/horizon-cursor.js";
 
 export interface HorizonTradePrint {
   tradeId: string;
@@ -16,6 +17,16 @@ export interface HorizonTradePrint {
   tradeType: string;
   occurredAtMs: number;
   receivedAtMs?: number;
+  ledgerCloseTime?: string;
+  baseOfferId?: string | null;
+  counterOfferId?: string | null;
+  baseAccount?: string | null;
+  counterAccount?: string | null;
+  baseLiquidityPoolId?: string | null;
+  counterLiquidityPoolId?: string | null;
+  operationId?: string | null;
+  transactionHash?: string | null;
+  horizonRawJson?: string;
 }
 
 export interface TradeStreamHandlers {
@@ -31,6 +42,33 @@ interface HorizonTradeRecord {
   base_is_seller: boolean;
   trade_type: string;
   price?: { n: string; d: string };
+}
+
+function stringField(record: object, key: string): string | null {
+  const value: unknown = Reflect.get(record, key);
+  return typeof value === "string" ? value : null;
+}
+
+function linkedIdentifier(record: object, relationship: "operation" | "transaction"): string | null {
+  const links: unknown = Reflect.get(record, "_links");
+  if (typeof links !== "object" || links === null) {
+    return null;
+  }
+  const link: unknown = Reflect.get(links, relationship);
+  if (typeof link !== "object" || link === null) {
+    return null;
+  }
+  const href: unknown = Reflect.get(link, "href");
+  if (typeof href !== "string") {
+    return null;
+  }
+  try {
+    const segments = new URL(href, "https://horizon.invalid").pathname.split("/").filter(Boolean);
+    const identifier = segments.at(-1);
+    return identifier ?? null;
+  } catch {
+    return null;
+  }
 }
 
 function toSdkAsset(asset: TradingPairConfig["base"]): Asset {
@@ -75,7 +113,14 @@ export class HorizonTradeSource {
       },
       isRetryableHorizonError,
     );
-    return response.records[0]?.paging_token ?? "now";
+    const cursor = response.records[0]?.paging_token;
+    if (cursor === undefined) {
+      return "now";
+    }
+    if (!parseHorizonCursor(cursor)) {
+      throw new Error(`Horizon returned an unsupported trade paging token: ${cursor}`);
+    }
+    return cursor;
   }
 
   async catchUp(
@@ -83,6 +128,9 @@ export class HorizonTradeSource {
     cursor: string,
     onTrade: (trade: HorizonTradePrint) => void,
   ): Promise<{ count: number; lastCursor: string }> {
+    if (cursor !== "now" && !parseHorizonCursor(cursor)) {
+      throw new Error(`Unsupported Horizon trade backfill cursor: ${cursor}`);
+    }
     let response = await withRetry(
       () => this.server
         .trades()
@@ -111,7 +159,12 @@ export class HorizonTradeSource {
         const trade = this.normalizeRecord(pair, record);
         onTrade(trade);
         count += 1;
-        lastCursor = trade.cursor;
+        const order = lastCursor === "now"
+          ? 1
+          : compareHorizonCursors(trade.cursor, lastCursor);
+        if (order !== null && order > 0) {
+          lastCursor = trade.cursor;
+        }
       }
       if (response.records.length < 200) {
         break;
@@ -147,6 +200,9 @@ export class HorizonTradeSource {
     pair: TradingPairConfig,
     record: HorizonTradeRecord,
   ): HorizonTradePrint {
+    if (!parseHorizonCursor(record.paging_token)) {
+      throw new Error(`Horizon trade ${record.id} has an unsupported paging token`);
+    }
     if (
       !record.price
       || !/^\d+$/.test(record.price.n)
@@ -169,6 +225,16 @@ export class HorizonTradeSource {
       tradeType: record.trade_type,
       occurredAtMs,
       receivedAtMs: Date.now(),
+      ledgerCloseTime: record.ledger_close_time,
+      baseOfferId: stringField(record, "base_offer_id"),
+      counterOfferId: stringField(record, "counter_offer_id"),
+      baseAccount: stringField(record, "base_account"),
+      counterAccount: stringField(record, "counter_account"),
+      baseLiquidityPoolId: stringField(record, "base_liquidity_pool_id"),
+      counterLiquidityPoolId: stringField(record, "counter_liquidity_pool_id"),
+      operationId: linkedIdentifier(record, "operation"),
+      transactionHash: linkedIdentifier(record, "transaction"),
+      horizonRawJson: JSON.stringify(record),
     };
   }
 }

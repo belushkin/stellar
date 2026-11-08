@@ -17,6 +17,7 @@ describe("openDatabase", () => {
           { version: 4 },
           { version: 5 },
           { version: 6 },
+          { version: 7 },
         ]);
       expect(database.prepare(`
         SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'paper_orders'
@@ -27,6 +28,16 @@ describe("openDatabase", () => {
       expect(database.prepare(`
         SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'research_execution_scenarios'
       `).get()).toEqual({ name: "research_execution_scenarios" });
+      const tradeColumns = database.prepare("PRAGMA table_info(market_trades)").all() as {
+        name: string;
+      }[];
+      expect(tradeColumns.map((column) => column.name)).toContain("horizon_raw_json");
+      const markoutColumns = database.prepare(
+        "PRAGMA table_info(research_markout_observations)",
+      ).all() as { name: string }[];
+      expect(markoutColumns.map((column) => column.name)).toContain("fill_reference_at_ms");
+      expect(markoutColumns.map((column) => column.name))
+        .toContain("fill_reference_time_basis");
     } finally {
       database.close();
     }

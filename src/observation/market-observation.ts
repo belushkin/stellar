@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import type Database from "better-sqlite3";
 
 import { Big } from "../common/decimal.js";
+import { compareHorizonCursors, parseHorizonCursor } from "../common/horizon-cursor.js";
 import { estimateExecutableVolume } from "../order-book/executable-volume.js";
 import type { OrderBookSnapshot } from "../order-book/types.js";
 import type { HorizonTradePrint } from "../market-data/trade-source.js";
@@ -34,18 +35,18 @@ function isPositiveDecimal(value: string): boolean {
 }
 
 function advanceCursor(database: Database.Database, pairId: string, cursor: string, nowMs: number): void {
+  if (!parseHorizonCursor(cursor)) {
+    return;
+  }
   const saved = database.prepare(`
     SELECT trade_cursor FROM stream_cursors WHERE pair_id = ?
   `).get(pairId) as { trade_cursor: string } | undefined;
-  const incomingValue = /^\d+$/.test(cursor) ? BigInt(cursor) : null;
-  const savedValue = saved && /^\d+$/.test(saved.trade_cursor)
-    ? BigInt(saved.trade_cursor)
-    : null;
-  const nextCursor = !saved
+  const savedOrder = saved && saved.trade_cursor !== "now"
+    ? compareHorizonCursors(cursor, saved.trade_cursor)
+    : 1;
+  const nextCursor = !saved || savedOrder === 1
     ? cursor
-    : incomingValue !== null && (savedValue === null || incomingValue > savedValue)
-      ? cursor
-      : saved.trade_cursor;
+    : saved.trade_cursor;
   database.prepare(`
     INSERT INTO stream_cursors (pair_id, trade_cursor, updated_at_ms) VALUES (?, ?, ?)
     ON CONFLICT(pair_id) DO UPDATE SET trade_cursor = excluded.trade_cursor,
@@ -132,6 +133,9 @@ function validateTrade(trade: HorizonTradePrint, nowMs: number): string[] {
   const reasons: string[] = [];
   if (!trade.tradeId || !trade.cursor || !trade.pairId) {
     reasons.push("trade_identity_missing");
+  }
+  if (trade.cursor && !parseHorizonCursor(trade.cursor)) {
+    reasons.push("trade_cursor_invalid");
   }
   if (!isPositiveDecimal(trade.baseAmount)) {
     reasons.push("trade_base_amount_invalid");
@@ -356,8 +360,11 @@ export function recordObservedTrade(input: {
       INSERT OR IGNORE INTO market_trades (
         trade_id, pair_id, cursor, occurred_at_ms, base_amount, price_numerator,
         price_denominator, base_is_seller, trade_type, source, received_at_ms,
-        received_sequence, validation_status, validation_reasons_json, raw_json
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        received_sequence, validation_status, validation_reasons_json, raw_json,
+        ledger_close_time, base_offer_id, counter_offer_id, base_account,
+        counter_account, base_liquidity_pool_id, counter_liquidity_pool_id,
+        operation_id, transaction_hash, horizon_raw_json
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       trade.tradeId,
       trade.pairId,
@@ -374,6 +381,16 @@ export function recordObservedTrade(input: {
       validationReasons.length === 0 ? "valid" : "quarantined",
       JSON.stringify(validationReasons),
       JSON.stringify(trade),
+      trade.ledgerCloseTime ?? null,
+      trade.baseOfferId ?? null,
+      trade.counterOfferId ?? null,
+      trade.baseAccount ?? null,
+      trade.counterAccount ?? null,
+      trade.baseLiquidityPoolId ?? null,
+      trade.counterLiquidityPoolId ?? null,
+      trade.operationId ?? null,
+      trade.transactionHash ?? null,
+      trade.horizonRawJson ?? null,
     );
     if (inserted.changes === 0) {
       const previous = input.database.prepare(`
@@ -434,12 +451,12 @@ export function recordObservedTrade(input: {
         `).run(JSON.stringify(validationReasons), nowMs, trade.tradeId);
         return { duplicate: true, validationReasons };
       }
-      if (trade.pairId && trade.cursor) {
+      if (trade.pairId && trade.cursor && parseHorizonCursor(trade.cursor)) {
         advanceCursor(input.database, trade.pairId, trade.cursor, nowMs);
       }
       return { duplicate: true, validationReasons };
     }
-    if (trade.pairId && trade.cursor) {
+    if (trade.pairId && trade.cursor && parseHorizonCursor(trade.cursor)) {
       advanceCursor(input.database, trade.pairId, trade.cursor, nowMs);
     }
 
